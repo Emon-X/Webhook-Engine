@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import select,and_, or_, func
+from sqlalchemy import select,and_, or_, func, update
 from app.db.models.webhook_event import WebhookEvent
 from datetime import datetime, timezone, timedelta
 from typing import Callable
@@ -39,35 +39,47 @@ def claim_next_event(db : Session):
     
     event.status = "processing"
     event.attempt_count += 1
+    event.claim_version += 1
     event.locked_until = datetime.now(timezone.utc) + timedelta(minutes=5)
     db.commit()
     db.refresh(event)
     
     return event
 
-def mark_event_as_processed(db: Session, event: WebhookEvent):
+def mark_event_as_processed(db: Session, event: WebhookEvent, expected_claim_version : int):
     
-    if event.status != "processing":
-        raise ValueError("Event must be in 'processing' status to mark as processed.")
+    statement  = (
+        update(WebhookEvent)
+        .where(
+            WebhookEvent.id == event.id,
+            WebhookEvent.status == "processing",
+            WebhookEvent.claim_version == expected_claim_version
+        )
+        .values(
+            status="processed",
+            processed_at=func.now(),
+            next_retry_at=None,
+            last_error=None,
+            locked_until=None
+        )
+        .execution_options(synchronize_session=False)
+    )
+    result = db.execute(statement)
     
-    event.status = "processed"
-    event.processed_at = datetime.now(timezone.utc)
-    event.next_retry_at = None
-    event.last_error = None
-    event.locked_until = None
-    
+    if result.rowcount !=1: 
+        db.rollback()
+        raise RuntimeError(
+            "Cannot mark event as processed: worker no longer owns this event"
+        )
+        
     db.commit()
     db.refresh(event)
-    
+   
     return event
     
     
-def mark_event_as_failed(db: Session, event: WebhookEvent, error: str):
+def mark_event_as_failed(db: Session, event: WebhookEvent, error: str, expected_claim_version : int):
     
-    if event.status != "processing":
-        raise ValueError("Event must be in 'processing' status to mark as failed.")
-    
-    event.last_error = error[:2000]
     
     if event.attempt_count >= event.max_attempts:
         event.status = "dead_letter"
@@ -77,25 +89,62 @@ def mark_event_as_failed(db: Session, event: WebhookEvent, error: str):
         
         event.status = "retrying"
         event.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delays_second)
+        
+        
+    statement = (
+        update(WebhookEvent)
+        .where(
+            WebhookEvent.id == event.id,
+            WebhookEvent.status == "processing",
+            WebhookEvent.claim_version == expected_claim_version
+        )
+        .values(
+            status=event.status,
+            last_error=str(error)[:2000],
+            next_retry_at=event.next_retry_at,
+            locked_until=None
+        )
+        .execution_options(synchronize_session=False)
+    )
     
-    event.locked_until = None
+    result = db.execute(statement)
+    
+    if result.rowcount != 1:
+        db.rollback()
+        raise RuntimeError(
+            "Cannot mark event as failed: worker no longer owns this event"
+        )
+    
     db.commit()
     db.refresh(event)
     
     return event
 
-
-def mark_event_as_dead_letter(db,event,error):
+def mark_event_as_dead_letter(db : Session,event : WebhookEvent,error : str, expected_claim_version : int):
     
-    if event.status !="processing":
-        raise ValueError(
-            "Event must be in 'processing' status to mark as dead letter."
+    statement = (
+        update(WebhookEvent)
+        .where(
+            WebhookEvent.id == event.id,
+            WebhookEvent.status == "processing",
+            WebhookEvent.claim_version == expected_claim_version
         )
+        .values(
+            status="dead_letter",
+            last_error=str(error)[:2000],
+            next_retry_at=None,
+            locked_until=None
+        )
+        .execution_options(synchronize_session=False)
+    )
     
-    event.status = "dead_letter"
-    event.last_error = str(error)[:2000]
-    event.next_retry_at = None
-    event.locked_until = None
+    result = db.execute(statement)
+    
+    if result.rowcount != 1:
+        db.rollback()
+        raise RuntimeError(
+            "Cannot mark event as dead letter: worker no longer owns this event"
+        )
 
     db.commit()
     db.refresh(event)
@@ -110,6 +159,8 @@ def process_next_event(db : Session,handler : Callable[[WebhookEvent], None]):
     if event is None:
         return None
     
+    expected_claim_version = event.claim_version
+    
     try:
         handler(event)
         
@@ -117,19 +168,22 @@ def process_next_event(db : Session,handler : Callable[[WebhookEvent], None]):
         return mark_event_as_dead_letter(
             db,
             event,
-            str(e)
+            str(e),
+            expected_claim_version
         )
     except TransientProcessingError as e:
         return mark_event_as_failed(
             db,
             event,
-            str(e)
+            str(e),
+            expected_claim_version
         )
     except Exception as e:
         return mark_event_as_failed(
             db,
             event,
-            str(e)
+            str(e),
+            expected_claim_version
         )
     
-    return mark_event_as_processed(db, event)
+    return mark_event_as_processed(db, event, expected_claim_version)

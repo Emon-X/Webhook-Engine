@@ -10,7 +10,9 @@ from app.db.base import Base
 from app.db.session import get_db
 
 # Import models so SQLAlchemy registers their tables in Base.metadata.
-from app.db.models import Source
+from sqlalchemy import delete
+from app.db.models.source import Source
+from app.db.models.webhook_event import WebhookEvent
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -93,9 +95,17 @@ def client(db_connection):
 
 @pytest.fixture
 def independent_session_factory(test_engine):
-    return sessionmaker(
+    SessionFactory = sessionmaker(
         bind=test_engine,
         autoflush=False,
         autocommit=False,
         expire_on_commit=False
     )
+    
+    yield SessionFactory
+    
+    # Clean up the database after the test.
+    with test_engine.connect() as connection:
+        connection.execute(delete(WebhookEvent))
+        connection.execute(delete(Source))
+        connection.commit()

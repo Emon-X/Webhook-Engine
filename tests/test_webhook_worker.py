@@ -73,7 +73,11 @@ def test_mark_event_processed(db_session):
     db_session.commit()
     db_session.refresh(event)
 
-    processed_event = mark_event_as_processed(db_session, event)
+    processed_event = mark_event_as_processed(
+        db_session,
+        event,
+        expected_claim_version=event.claim_version
+    )
 
     assert processed_event.status == "processed"
     assert processed_event.processed_at is not None
@@ -109,7 +113,8 @@ def test_mark_event_failed(db_session):
     failed_event = mark_event_as_failed(
         db_session,
         event,
-        "External service unavailable"
+        "External service unavailable",
+        expected_claim_version=event.claim_version
     )
     
     assert failed_event.status == "retrying"
@@ -145,7 +150,8 @@ def test_mark_event_failed_dead_letter(db_session):
     failed_event = mark_event_as_failed(
         db_session,
         event,
-        "Maximum retry attempts reached"
+        "Maximum retry attempts reached",
+        expected_claim_version=event.claim_version
     )
     
     assert failed_event.status == "dead_letter"
