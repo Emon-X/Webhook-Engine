@@ -4,8 +4,12 @@ from app.db.models.webhook_event import WebhookEvent
 from datetime import datetime, timezone, timedelta
 from typing import Callable
 from app.core.exceptions import TransientProcessingError, PermanentProcessingError
+import threading, logging
+from app.db.session import SessionLocal
 
-def claim_next_event(db : Session):
+logger = logging.getLogger(__name__)
+
+def claim_next_event(db : Session, lease_duration_seconds: int = 300):
     
     eligible_event = or_(
         WebhookEvent.status == "received",
@@ -40,11 +44,97 @@ def claim_next_event(db : Session):
     event.status = "processing"
     event.attempt_count += 1
     event.claim_version += 1
-    event.locked_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+    event.locked_until = func.now() + timedelta(seconds=lease_duration_seconds)
     db.commit()
     db.refresh(event)
     
     return event
+
+def renew_event_lease(db: Session,event: WebhookEvent,expected_claim_version: int,lease_duration_seconds: int = 300):
+    
+    statement = (
+        update(WebhookEvent)
+        .where(
+            WebhookEvent.id == event.id,
+            WebhookEvent.status == "processing",
+            WebhookEvent.claim_version == expected_claim_version,
+            WebhookEvent.locked_until > func.now()
+        )
+        .values(
+            locked_until=func.now() + timedelta(
+                seconds=lease_duration_seconds
+            )
+        )
+        .execution_options(synchronize_session=False)
+    )
+
+    result = db.execute(statement)
+
+    if result.rowcount != 1:
+        db.rollback()
+        raise RuntimeError(
+            "Cannot renew lease: worker no longer owns this event"
+        )
+
+    db.commit()
+    db.refresh(event)
+
+    return event
+
+def start_lease_heartbeat(event_id,claim_version: int,lease_duration_seconds: int = 300,renewal_interval_seconds: int = 60):
+    stop_event = threading.Event()
+    heartbeat_failed = threading.Event()
+
+    def heartbeat():
+        while not stop_event.wait(renewal_interval_seconds):
+            try:
+                with SessionLocal() as db:
+                    
+                    event = db.get(WebhookEvent, event_id)
+
+                    if event is None:
+                        logger.warning(
+                            "Heartbeat stopped: event %s not found",
+                            event_id
+                        )
+                        break
+
+                    renew_event_lease(
+                        db,
+                        event,
+                        expected_claim_version=claim_version,
+                        lease_duration_seconds=lease_duration_seconds
+                    )
+
+                    logger.debug(
+                        "Lease renewed for event %s",
+                        event_id
+                    )
+
+            except RuntimeError:
+                logger.warning(
+                    "Heartbeat stopped: worker lost ownership of event %s",
+                    event_id
+                )
+                heartbeat_failed.set()
+                break
+
+            except Exception:
+                logger.exception(
+                    "Unexpected heartbeat error for event %s",
+                    event_id
+                )
+                heartbeat_failed.set()
+                break
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat,
+        daemon=True
+    )
+
+    heartbeat_thread.start()
+
+    return stop_event, heartbeat_thread,heartbeat_failed
 
 def mark_event_as_processed(db: Session, event: WebhookEvent, expected_claim_version : int):
     
@@ -88,7 +178,7 @@ def mark_event_as_failed(db: Session, event: WebhookEvent, error: str, expected_
         delays_second = min(2 ** event.attempt_count, 3600)
         
         event.status = "retrying"
-        event.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delays_second)
+        event.next_retry_at = func.now() + timedelta(seconds=delays_second)
         
         
     statement = (
@@ -161,29 +251,57 @@ def process_next_event(db : Session,handler : Callable[[WebhookEvent], None]):
     
     expected_claim_version = event.claim_version
     
+    stop_event, heartbeat_thread, heartbeat_failed = start_lease_heartbeat(
+        event_id=event.id,
+        claim_version=expected_claim_version,
+        lease_duration_seconds=300,
+        renewal_interval_seconds=60
+    )
+    
+    permanent_error = None
+    processing_error = None
+    
     try:
-        handler(event)
+        handler(event,heartbeat_failed)
         
     except PermanentProcessingError as e:
+        permanent_error = str(e)
+
+    except TransientProcessingError as e:
+        processing_error = str(e)
+
+    except Exception as e:
+        processing_error = str(e)
+
+    finally:
+        stop_event.set()
+        heartbeat_thread.join()
+        
+    if heartbeat_failed.is_set():
+        raise RuntimeError(
+            f"Heartbeat failed while processing event {event.id}. "
+            "Worker cannot safely finalize this event."
+        )
+        
+    if permanent_error is not None:
         return mark_event_as_dead_letter(
             db,
             event,
-            str(e),
+            permanent_error,
             expected_claim_version
         )
-    except TransientProcessingError as e:
+
+    if processing_error is not None:
         return mark_event_as_failed(
             db,
             event,
-            str(e),
+            processing_error,
             expected_claim_version
         )
-    except Exception as e:
-        return mark_event_as_failed(
-            db,
-            event,
-            str(e),
-            expected_claim_version
-        )
-    
-    return mark_event_as_processed(db, event, expected_claim_version)
+
+    return mark_event_as_processed(
+        db,
+        event,
+        expected_claim_version
+    )
+

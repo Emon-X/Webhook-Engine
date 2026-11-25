@@ -8,6 +8,7 @@ from app.db.models.webhook_event import WebhookEvent
 from app.db.models.source import Source
 from app.services.event_handlers import dispatch_event
 from app.handlers.register import register_handlers
+from datetime import datetime,timezone
 
 
 def test_claim_next_event(db_session):
@@ -122,6 +123,99 @@ def test_mark_event_failed(db_session):
     assert failed_event.next_retry_at is not None
     assert failed_event.attempt_count == 1
     
+def test_retry_uses_exponential_backoff(db_session):
+    source = Source(
+        name="exponential_backoff_source",
+        signing_secret_encrypted=None
+    )
+
+    db_session.add(source)
+    db_session.flush()
+
+    event = WebhookEvent(
+        source_id=source.id,
+        external_event_id="backoff_event_1",
+        event_type="test_event",
+        payload={"key": "value"},
+        status="processing",
+        attempt_count=1,
+        max_attempts=10
+    )
+
+    db_session.add(event)
+    db_session.commit()
+    db_session.refresh(event)
+
+    first_retry = mark_event_as_failed(
+        db_session,
+        event,
+        "Temporary failure",
+        expected_claim_version=event.claim_version
+    )
+
+    first_delay = (
+        first_retry.next_retry_at - datetime.now(timezone.utc)
+    ).total_seconds()
+
+    assert 1 <= first_delay <= 2
+
+    # Simulate another processing attempt.
+    first_retry.status = "processing"
+    first_retry.attempt_count = 2
+    db_session.commit()
+
+    second_retry = mark_event_as_failed(
+        db_session,
+        first_retry,
+        "Temporary failure",
+        expected_claim_version=first_retry.claim_version
+    )
+
+    second_delay = (
+        second_retry.next_retry_at - datetime.now(timezone.utc)
+    ).total_seconds()
+
+    assert 3 <= second_delay <= 4
+    assert second_delay > first_delay
+    
+def test_retry_delay_never_exceeds_one_hour(db_session):
+
+    source = Source(
+        name="max_backoff_source",
+        signing_secret_encrypted=None
+    )
+
+    db_session.add(source)
+    db_session.flush()
+
+    event = WebhookEvent(
+        source_id=source.id,
+        external_event_id="max_backoff_event",
+        event_type="test_event",
+        payload={"key": "value"},
+        status="processing",
+        attempt_count=15,
+        max_attempts=20
+    )
+
+    db_session.add(event)
+    db_session.commit()
+    db_session.refresh(event)
+
+    failed_event = mark_event_as_failed(
+        db_session,
+        event,
+        "Temporary failure",
+        expected_claim_version=event.claim_version
+    )
+
+    delay = (
+        failed_event.next_retry_at - datetime.now(timezone.utc)
+    ).total_seconds()
+
+    assert failed_event.status == "retrying"
+    assert 3598 <= delay <= 3600
+    
 def test_mark_event_failed_dead_letter(db_session):
     
     source = Source(
@@ -183,7 +277,7 @@ def test_process_next_event_success(db_session):
     db_session.add(event)
     db_session.commit()
 
-    def successful_handler(event):
+    def successful_handler(event,cancellation_event):
         assert event.event_type == "test_event"
 
     result = process_next_event(
@@ -221,7 +315,7 @@ def test_process_next_event_failure(db_session):
 
     db_session.refresh(event)
 
-    def failing_handler(event):
+    def failing_handler(event, cancellation_event):
         raise RuntimeError("Simulated processing failure")
 
     result = process_next_event(
@@ -322,3 +416,40 @@ def test_process_order_created_permanent_failure(db_session):
     assert result.last_error == "Invalid order data"
     assert result.next_retry_at is None
     assert result.locked_until is None
+    
+def test_failed_event_moves_to_dead_letter_after_max_attempts(db_session):
+
+    source = Source(
+        name="max_attempts_source",
+        signing_secret_encrypted=None
+    )
+
+    db_session.add(source)
+    db_session.flush()
+
+    event = WebhookEvent(
+        source_id=source.id,
+        external_event_id="max_attempts_event",
+        event_type="test_event",
+        payload={"key": "value"},
+        status="processing",
+        attempt_count=5,
+        max_attempts=5,
+        claim_version=1
+    )
+
+    db_session.add(event)
+    db_session.commit()
+    db_session.refresh(event)
+
+    failed_event = mark_event_as_failed(
+        db_session,
+        event,
+        "Maximum attempts reached",
+        expected_claim_version=1
+    )
+
+    assert failed_event.status == "dead_letter"
+    assert failed_event.last_error == "Maximum attempts reached"
+    assert failed_event.next_retry_at is None
+    assert failed_event.locked_until is None

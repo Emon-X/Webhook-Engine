@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 from types import SimpleNamespace
 from app.core.exceptions import PermanentProcessingError, TransientProcessingError
@@ -16,9 +18,9 @@ def test_handle_valid_order_created():
             }
         }
     )
-
+    cancellation_event = threading.Event()
     # Should execute without raising an exception.
-    handle_order_created(event)
+    handle_order_created(event, cancellation_event)
 
 
 def test_handle_order_created_missing_data():
@@ -32,9 +34,10 @@ def test_handle_order_created_missing_data():
             }
         }
     )
+    cancellation_event = threading.Event()
 
     with pytest.raises(PermanentProcessingError):
-        handle_order_created(event)
+        handle_order_created(event, cancellation_event)
 
 
 def test_handle_order_created_invalid_data():
@@ -46,6 +49,7 @@ def test_handle_order_created_invalid_data():
             "data": None
         }
     )
+    cancellation_event = threading.Event()
 
     with pytest.raises(PermanentProcessingError):
-        handle_order_created(event)
+        handle_order_created(event, cancellation_event)
